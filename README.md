@@ -110,3 +110,6 @@ If you set `API_KEY` in `.env`, include `x-api-key: <value>` in every request.
 
 Use the provided cURL snippets or any REST client. For integration testing, spin up Docker services, seed the database, and exercise the queue-driven assignment flow by creating rides and observing driver state transitions via the endpoints.
 
+
+
+<!-- Backed up to GitHub: 2026-11-15 17:59:57 UTC -->

@@ -50,84 +50,87 @@ src/
 data-source.ts
 ```
 
-## App Bootstrap
+## App Bootstrap (why each exists, what it does)
 - `main.ts`
-  - Creates Nest app.
-  - Enables global `ValidationPipe` to enforce DTO validation.
-  - Registers global `AllExceptionsFilter` for consistent error responses.
-  - Registers `LoggingInterceptor` for request logs with duration.
-  - Generates OpenAPI document and serves Scalar UI at `/api/docs` using `apiReference`.
-  - Listens on `PORT` or 3000.
+  - Creates the Nest application instance. This is the single entry point.
+  - Applies a global `ValidationPipe` so all incoming payloads are validated against DTOs. Prevents invalid types/fields from reaching services.
+  - Registers `AllExceptionsFilter` globally to standardize error responses and avoid leaking stack traces to clients.
+  - Adds `LoggingInterceptor` to log request metadata and latency for basic observability without extra code in controllers.
+  - Generates an OpenAPI spec from decorators and serves Scalar API Reference at `/api/docs` so you can explore/test endpoints quickly.
+  - Starts the HTTP server on `PORT` from the environment for easy configuration across environments.
 
 - `app.module.ts`
-  - Loads env configuration via `ConfigModule`.
-  - Configures TypeORM with PostgreSQL; entities auto-discovered; `synchronize` disabled in production.
-  - Configures Bull (Redis) for queues.
-  - Imports `DriversModule`, `RidesModule`, `QueueModule`, `SeedModule`.
-  - Registers a global `ApiKeyGuard`. If `API_KEY` is set, every request must include `x-api-key`.
+  - Central module that wires configuration, database, queue, and feature modules.
+  - `ConfigModule.forRoot` loads `.env` and exposes config values through dependency injection.
+  - `TypeOrmModule.forRootAsync` connects to PostgreSQL; loads all `*.entity.ts` automatically; keeps `synchronize` off for safety (we use migrations).
+  - `BullModule.forRootAsync` connects to Redis so background jobs can be queued/processed.
+  - Imports feature modules: `DriversModule`, `RidesModule`, and `QueueModule`, plus `SeedModule` for CLI seeding.
+  - Registers `ApiKeyGuard` as a global guard. If `API_KEY` is set, every request must provide `x-api-key`; if not set, guard allows all traffic. This keeps runtime simple while enabling basic protection when desired.
 
 ## Configuration
 - `src/config/database.config.ts`
-  - Exposes database and redis configuration via `registerAs`.
-  - Reads host, port, credentials from environment variables.
+  - Encapsulates database and redis settings behind Nest’s config system. This keeps `app.module.ts` clean and enforces a single source of truth for env values.
 
 ## Global Layer
 - `common/guards/api-key.guard.ts`
-  - Enforces optional API key: compares request header against `process.env.API_KEY`.
+  - Looks for an API key in headers and checks it against `API_KEY`. Off by default if no env var is set. Useful for demos/interviews while still making tests repeatable.
 
 - `common/interceptors/logging.interceptor.ts`
-  - Logs each request method, URL, status code, and elapsed time.
+  - Logs method, URL, status code, and duration. Helps identify slow endpoints and verify traffic flow in development without external tooling.
 
 - `common/filters/http-exception.filter.ts`
-  - Catches exceptions and returns a JSON payload `{ statusCode, path, timestamp, message }`.
+  - Converts thrown errors into consistent JSON responses. Clients always receive predictable shape: `statusCode`, `path`, `timestamp`, and `message`.
 
 ## Data Model
 - `drivers/entities/driver.entity.ts`
-  - `id`: uuid PK
-  - `name`: string (indexed)
-  - `status`: enum('available','busy') (indexed)
-  - `location`: `geography(Point,4326)` as GeoJSON `Point`
-  - `createdAt`, `updatedAt`
-  - `rides`: one-to-many relation
+  - Fields
+    - `id`: primary key (uuid) for uniqueness and easy client generation.
+    - `name`: indexed for potential lookup/testing.
+    - `status`: enum to enforce valid values (`available`, `busy`), indexed for fast filtering.
+    - `location`: PostGIS `geography(Point,4326)` to store real-world coordinates (WGS84). Typed as GeoJSON `Point` in code.
+    - `createdAt`/`updatedAt`: automatic timestamps for auditing.
+    - Relation: one-to-many with rides so ORM can navigate from driver to its rides.
+  - Why geography: distance math is accurate on earth’s surface; allows KNN `<->` ordering and `ST_Distance`.
 
 - `rides/entities/ride.entity.ts`
-  - `id`: uuid PK
-  - `userId`: string (indexed)
-  - `pickupLat`, `pickupLng`, `pickupAddress`
-  - `destinationLat`, `destinationLng`, `destinationAddress`
-  - `status`: enum('pending','assigned','accepted','completed','cancelled') (indexed)
-  - `driverId`: nullable uuid FK to `drivers(id)`
-  - `createdAt`, `updatedAt`
+  - Fields
+    - `id`: uuid PK.
+    - `userId`: indexed for fetching user history later.
+    - `pickupLat`/`pickupLng` + address: source location storage for visibility and distance calculations.
+    - `destinationLat`/`destinationLng` + address: destination details for UI/receipt.
+    - `status`: enum enforcing progression through states.
+    - `driverId`: nullable foreign key for assignment.
+    - Timestamps.
+  - Why denormalized coords: makes assignment logic simpler and avoids joins for pickup point.
 
 ## DTO Validation
 - `rides/dto/create-ride.dto.ts`
-  - Validates `userId` as string, coordinates as lat/lng, address length.
+  - Guarantees well-formed ride creation payloads (types, bounds), reducing defensive code in services.
 
 - `drivers/dto/find-nearby-drivers.dto.ts`
-  - Validates query: `lat`, `lng`, optional `limit` with min/max.
+  - Ensures nearby search queries are valid (lat/lng semantics, reasonable limits).
 
 ## Business Logic
 - `rides/rides.service.ts`
-  - `createRide` persists the ride with status `pending` and enqueues assignment job.
-  - `findById` fetches ride with driver relation.
+  - `createRide`: persists a `pending` ride, then enqueues a background assignment job so the HTTP request returns fast and assignment is resilient to spikes.
+  - `findById`: loads a ride (with driver relation) for detail views.
 
 - `drivers/drivers.service.ts`
-  - `findAll` returns all drivers.
-  - `findNearby` performs PostGIS distance calculation and `<->` ordering for speed:
-    - `ST_SetSRID(ST_MakePoint(:lng,:lat),4326)`
-    - `ST_Distance(driver.location, point) / 1000 AS distance_km`
-    - Ordered by `driver.location <-> point`.
-  - `acceptRide` validates that a ride is not already owned and is in an acceptable state, then marks ride `accepted` and driver `busy`.
+  - `findAll`: simple listing endpoint for admin/testing.
+  - `findNearby`: builds a PostGIS point from query, adds `distance_km` via `ST_Distance`, and uses KNN `<->` ordering to return true nearest drivers efficiently. Limits to a caller-provided or default count.
+  - `acceptRide`: guards against race conditions by checking state and ownership before updating ride to `accepted` and driver to `busy`.
 
 ## Controllers
 - `rides/rides.controller.ts`
-  - `POST /rides` → create ride, enqueue assignment.
-  - `GET /rides/:id` → ride details with driver.
+  - Thin layer that validates inputs and delegates to services:
+    - `POST /rides`: creates and enqueues.
+    - `GET /rides/:id`: fetches details.
 
 - `drivers/drivers.controller.ts`
-  - `GET /drivers` → list drivers.
-  - `GET /drivers/nearby` → nearest available drivers (with distance in km).
-  - `POST /drivers/:driverId/accept/:rideId` → accept ride.
+  - Endpoints:
+    - `GET /drivers`: list drivers for visibility/testing.
+    - `GET /drivers/nearby`: geospatial nearest search.
+    - `POST /drivers/:driverId/accept/:rideId`: driver accepts ride, applying service validations.
 
 ## Queue System (Bull + Redis)
 - `queue/constants/queue.constants.ts`
@@ -147,6 +150,7 @@ data-source.ts
       - Update `drivers`: set status `busy`.
   - `@OnQueueFailed handleFailed`:
     - After final attempt, resets ride to `pending` and `driverId` to null; logs failure.
+  - Why a queue: decouples assignment from the HTTP lifecycle, enabling retries, smoothing bursts, and avoiding long request times.
 
 ## PostGIS Queries
 - Creating a point from coordinates:
@@ -155,22 +159,27 @@ data-source.ts
   - `driver.location <-> ST_SetSRID(ST_MakePoint(:lng,:lat), 4326)`
 - Getting numeric distance in km:
   - `ST_Distance(driver.location, point) / 1000 AS distance_km`
+- Why `<->` ordering: leverages index-assisted nearest-neighbor search for speed; `ST_Distance` is still selected to present a human-friendly value.
 
 ## Database Lifecycle
 - `database/migrations/1700000000000-init-schema.ts`
   - Enables `uuid-ossp` and `postgis`.
   - Creates enums, tables, indexes, FK.
+  - Why migrations: safe, repeatable schema changes across environments; prevents accidental destructive syncs.
 
 - `data-source.ts`
   - TypeORM CLI configuration for migrations (`-d data-source.ts`).
+  - Exported as a single `DataSource` to satisfy CLI expectations.
 
 ## Seeding
 - `database/seeds/seed.service.ts`
   - Truncates `rides` and `drivers` with `CASCADE`.
   - Inserts 20 drivers with random Lagos coordinates (lat 6.5–6.6, lng 3.3–3.4), random availability.
+  - Why random: produces realistic distribution for nearby search demos.
 
 - `database/seeds/run-seed.ts`
   - Bootstraps Nest application context, runs `SeedService`, then exits.
+  - Uses the real application DI graph so repositories and configs are identical to runtime.
 
 ## API Documentation
 - OpenAPI is generated from controllers and DTOs.
@@ -183,6 +192,7 @@ data-source.ts
   - `REDIS_HOST`, `REDIS_PORT`
   - `PORT`, `NODE_ENV`
   - `API_KEY` (optional)
+  - Why `.env.example`: communicates required settings to other developers/CI without committing secrets.
 
 ## NPM Scripts
 - `start:dev`: Start Nest in watch mode.
@@ -198,5 +208,18 @@ data-source.ts
 3. Processor selects the nearest `available` driver and assigns the ride; driver becomes `busy`.
 4. Driver confirms via `POST /drivers/:driverId/accept/:rideId`; ride becomes `accepted`.
 5. Observability and errors are handled globally, and docs are viewable at `/api/docs`.
+
+## Why the folders are structured this way
+- `modules/*`: Feature-oriented boundaries (drivers, rides, queue) keep controllers/services/entities together, supporting incremental growth and independent testing.
+- `common/*`: Cross-cutting concerns (auth, logging, error handling) that apply application-wide live here to avoid duplication.
+- `config/*`: Central place for environment-driven settings prevents scattering env reads throughout code.
+- `database/*`: Migrations and seeds are close to the domain but isolated from runtime logic to avoid accidental coupling.
+- Root `data-source.ts`: kept outside `src` to work smoothly with TypeORM CLI and avoid bundling it into the application build.
+
+## Where to add/extend things
+- New endpoints: add DTOs → controller routes → service methods inside the relevant feature module.
+- New background tasks: add a new queue name, service method to enqueue, and a processor handler.
+- More ride states: extend `RideStatus` enum and update service/processor logic accordingly.
+- Auth: replace `ApiKeyGuard` with a real auth strategy (JWT/session) under `common/guards` and wire it in `app.module.ts`.
 
 

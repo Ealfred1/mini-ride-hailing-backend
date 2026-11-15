@@ -14,3 +14,13 @@ ARCHITECTURE.md
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Auto-added standard ignores for backup
+node_modules/
+.next/
+dist/
+build/
+.cache/
+*.log
+venv/
+.env*
